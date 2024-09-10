@@ -1,35 +1,87 @@
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
-from itertools import cycle
+import json
+import os
 import random
 from pomice import Queue, Track, Player
+import discord  
+
+
+QUEUE_FILE = 'queue_state.json'
 
 class CustomQueue(Queue):
     def __init__(self):
         super().__init__()
         self.mode = "Normal"
-        self.user_track_map = defaultdict(deque)  # Use deque to maintain the order of requests
-        self.request_times = defaultdict(list)
-        self.track_score_map = {}
-        self.played_tracks = set()  # Track played songs
-
-    def put(self, track: Track):
-        # Track the request time
-        self.request_times[track.requester].append(datetime.now())
-        self.user_track_map[track.requester].append(track)
+        self.user_track_map = defaultdict(deque)  # Track songs by user
+        self.current_user_cycle = None  # Iterator for the round robin cycle
+        self.load_queue()
+        self.songs = {}
         
-        if self.mode == "Fair":
-            self._queue.append(track)
-            self._calculate_fair_scores()
-            self._sort_fair()
-        elif self.mode == "Round Robin":
+        
+    def save_queue(self):
+        queue_state = {
+            "queue_object": {'queue': [(track.uri, track.requester.id) for track in self._queue], 'mode': self.mode},
+        }
+        with open(QUEUE_FILE, 'w') as f:
+            json.dump(queue_state, f)
+         
+    def load_queue(self):
+        if os.path.exists(QUEUE_FILE):
+            with open(QUEUE_FILE, 'r') as f:
+                queue_state = json.load(f)
+        
+            queue_object = queue_state.get('queue_object', None)
+            if queue_object:
+                return queue_object
+          
+    def put(self, track: Track) -> int:
+        """puts a track into the queue
+
+        Args:
+            track (Track): Track to be added
+
+        Returns:
+            int: position of the track in the queue
+        """
+        if track.requester.id not in self.songs:
+            self.songs[track.requester.id] = []
+        self.songs[track.requester.id].append(track)
+        # Track the request time
+        if self.mode == "Round Robin":
             self._queue.append(track)
             self._sort_round_robin()
         elif self.mode == "Anarchy":
             self._queue.append(track)
             random.shuffle(self._queue)  # Shuffle the queue after adding a new track
         else:
-            self._queue.append(track)  # Normal mode
+            self._queue.append(track)  # Normal mode   
+            
+        position = self.find_position(track)
+        return position
+
+        
+    def get_user_song(self, member: discord.Member, n: int):
+        if n > 0:
+            if n > len(self._queue):
+                return "Index Longer than Queue!"
+            else:
+                if self._queue[n-1].requester.id == member.id:
+                    return self._queue[n-1] 
+                else:
+                    if member.guild_permissions.manage_messages:
+                        return self._queue[n-1]
+                    else:
+                        return "You can't remove somebody else's song"
+        elif n == 0:
+            return "That's a skip."
+        else:
+            user_songs = self.songs.get(member.id, [])
+            if abs(n) > len(user_songs):
+                return "Index longer than user queue"
+            else:
+                
+                return user_songs[n]
+            
 
     def get(self) -> Track:
         if self.is_empty:
@@ -37,48 +89,43 @@ class CustomQueue(Queue):
             return
         if self.mode == "Anarchy":
             random.shuffle(self._queue)  # Shuffle before each retrieval in Anarchy mode
-        return self._queue.pop(0)
-
-    def _calculate_fair_scores(self):
-        # Define the time window for counting requests (e.g., 15 minutes)
-        time_window = timedelta(minutes=10)
-        current_time = datetime.now()
-
-        for track in self._queue:
-            requester = track.requester
-            # Calculate the number of requests within the time window
-            recent_requests = [t for t in self.request_times[requester] if t >= current_time - time_window]
-
-            # Calculate the score based on the defined factors
-            score = (
-                len(recent_requests) * 10  # Penalty for multiple requests in the time window
-                + track.length / 60  # Penalize longer tracks (in minutes)
-                + sum(t.length for t in self.user_track_map[requester]) / 600  # Penalize users with many or long requests
-            )
-            self.track_score_map[track.title] = score
-
-    def _sort_fair(self):
-        # Sort the queue based on the calculated scores (ascending order)
-        self._queue.sort(key=lambda track: self.track_score_map.get(track, 0))
-
+        song = self._queue.pop(0)
+    
+        return song
+    
+    def _sort_normal(self):
+        # Iterate over users, for each user, pick a song from them 
+        self._queue.clear()
+        for track in self.request_times:
+            self._queue.append(track)
+        
+    def _sort_anarchy(self):
+        random.shuffle(self._queue)
+    
     def _sort_round_robin(self):
-        tracks = []
-        user_tracks = defaultdict(list)
-        for track in self._queue:
-            user_tracks[track.requester].append(track)
-        users = cycle(user_tracks.keys())
-        while len(tracks) < len(self._queue):
-            user = next(users)
-            if user_tracks[user]:
-                tracks.append(user_tracks[user].pop(0))
-        self._queue = tracks
-
+        new_queue = []
+        print(self.songs)
+        max_length = max([len(self.songs[user]) for user in self.songs])
+        for n in range(max_length):
+            for user in self.songs: 
+                print(f"{n} - {user}")
+                if n >= len(self.songs[user]) or self.songs[user] == []:
+                    continue
+                new_queue.append(self.songs[user][n])
+                print(new_queue)
+        print(new_queue)
+        self._queue.clear()
+        self._queue = new_queue 
+        
+                
+            
+    
+        
     def set_mode(self, mode: str):
         self.mode = mode
-        if mode == "Fair":
-            self._calculate_fair_scores()  # Calculate scores immediately when switching to Fair mode
-            self._sort_fair()
-        elif mode == "Round Robin":
+        if mode == "Normal":
+            self._sort_normal()  # Apply sorting when switching to Normal mode
+        if mode == "Round Robin":
             self._sort_round_robin()  # Apply sorting when switching to Round Robin mode
         elif mode == "Anarchy":
             random.shuffle(self._queue)  # Shuffle when switching to Anarchy mode
